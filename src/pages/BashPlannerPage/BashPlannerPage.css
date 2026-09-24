@@ -1,0 +1,60 @@
+.bash-planner-shell {
+  background-color: var(--bg-tertiary);
+  width: 100%;
+}
+
+.bash-planner-page {
+  max-width: var(--container-2xl);
+  margin: 0 auto;
+  padding: var(--space-xl) var(--space-2xl) var(--space-3xl);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-lg);
+}
+
+.bash-planner-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(12rem, 1fr));
+  gap: var(--space-md);
+  align-items: end;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  padding: var(--space-md);
+}
+
+.bash-planner-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-disabled);
+  font-weight: 700;
+}
+
+.bash-planner-visit {
+  grid-column: 1 / -1;
+}
+
+.bash-planner-error {
+  color: var(--text-error, #b42318);
+}
+
+.bash-planner-caution {
+  color: var(--text-secondary);
+}
+
+.bash-planner-hops {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+  padding-left: 1.25rem;
+}
+
+.bash-planner-hops ul {
+  margin: 0.35rem 0 0;
+  padding-left: 1.1rem;
+  color: var(--text-secondary);
+}

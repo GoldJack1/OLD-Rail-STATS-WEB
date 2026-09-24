@@ -1,6 +1,7 @@
 import React, { useEffect } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../../../contexts/AuthContext'
+import { isDarwinPreviewUser } from '../../../utils/darwinPreviewAccess'
 import { useTheme } from '../../../hooks/useTheme'
 import {
   isStationAdminModeActive,
@@ -12,6 +13,7 @@ import './Footer.css'
 
 const Footer: React.FC = () => {
   const { user, logout } = useAuth()
+  const darwinPreview = isDarwinPreviewUser(user)
   const { theme, toggleTheme } = useTheme()
   const location = useLocation()
   const navigate = useNavigate()
@@ -103,7 +105,25 @@ const Footer: React.FC = () => {
             </BUTFooterLink>
           </div>
         </div>
-        {user ? (
+        {user && darwinPreview ? (
+          <div className="site-footer-secondary-row">
+            <div className="site-footer-links site-footer-links--logged-in-row">
+              <BUTFooterLink to="/departures">
+                Departures
+              </BUTFooterLink>
+              <BUTFooterLink to="/units">
+                Units
+              </BUTFooterLink>
+              <BUTFooterLink to="/bash">
+                Bash
+              </BUTFooterLink>
+              <BUTFooterLink to="/api-status">
+                API Status
+              </BUTFooterLink>
+            </div>
+          </div>
+        ) : null}
+        {user && !darwinPreview ? (
           <div className="site-footer-secondary-row">
             <div className="site-footer-links site-footer-links--logged-in-row">
               <BUTFooterLink to="/stations">

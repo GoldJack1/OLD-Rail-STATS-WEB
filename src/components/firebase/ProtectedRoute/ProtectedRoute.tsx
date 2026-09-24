@@ -4,9 +4,14 @@ import { reload } from 'firebase/auth'
 import { useAuth } from '../../../contexts/AuthContext'
 import { initializeFirebase, getFirebaseAuth } from '../../../services/firebase'
 import { userMustEnrollTotpMfaOnFirebase } from '../../../services/firebaseTotpMfa'
+import { canUseDarwinTools, isDarwinPreviewUser, isFullSiteAdmin } from '../../../utils/darwinPreviewAccess'
 
 interface ProtectedRouteProps {
   children: React.ReactNode
+  /** Station editor / design system — not Darwin preview accounts. */
+  requireFullAdmin?: boolean
+  /** Departures tools, bash, API status — owner or Darwin preview accounts. */
+  requireDarwinTools?: boolean
 }
 
 type ProfileCheck = 'idle' | 'checking' | 'ok' | 'need-email-verify' | 'need-totp-enroll'
@@ -17,7 +22,7 @@ const isLocalDevLoginBypassEnabled =
 /**
  * Requires a signed-in user with verified email and TOTP (authenticator) MFA enrolled.
  */
-const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children }) => {
+const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children, requireFullAdmin = false, requireDarwinTools = false }) => {
   if (isLocalDevLoginBypassEnabled) {
     return <>{children}</>
   }
@@ -116,6 +121,14 @@ const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children }) => {
         Loading…
       </div>
     )
+  }
+
+  if (requireDarwinTools && !canUseDarwinTools(user)) {
+    return <Navigate to={isDarwinPreviewUser(user) ? '/departures' : '/log-in'} replace />
+  }
+
+  if (requireFullAdmin && !isFullSiteAdmin(user)) {
+    return <Navigate to={isDarwinPreviewUser(user) ? '/departures' : '/log-in'} replace />
   }
 
   return <>{children}</>

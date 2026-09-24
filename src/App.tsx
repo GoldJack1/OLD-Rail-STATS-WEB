@@ -29,6 +29,7 @@ import ServiceDetailPage from './pages/ServiceDetailPage'
 import UnitLookupPage from './pages/UnitLookupPage'
 import UnitsInServicePage from './pages/UnitsInServicePage'
 import ApiStatusPage from './pages/ApiStatusPage'
+import BashPlannerPage from './pages/BashPlannerPage'
 import NotFoundPage from './pages/NotFoundPage'
 import Header from './components/misc/Header/Header'
 import Footer from './components/misc/Footer/Footer'
@@ -58,6 +59,7 @@ const PAGE_TITLES: Record<string, string> = {
   '/departures': 'Live Departures | Rail Statistics',
   '/services': 'Service Detail | Rail Statistics',
   '/units': 'Units in Service | Rail Statistics',
+  '/bash': 'Station Bash | Rail Statistics',
   '/api-status': 'API Status | Rail Statistics',
   '/privacy': 'Privacy Policy | Rail Statistics',
   '/eula': 'EULA | Rail Statistics',
@@ -93,33 +95,34 @@ const App: React.FC = () => {
                 <Route path="/home" element={<HomePage />} />
                 <Route path="/log-in" element={<LoginPage />} />
                 <Route path="/stations/map" element={<StationsMapPage />} />
-                <Route path="/stations" element={<ProtectedRoute><StationsPageRefactored /></ProtectedRoute>} />
-                <Route path="/stations/edit" element={<ProtectedRoute><StationsPageRefactored initialMode="edit" /></ProtectedRoute>} />
-                <Route path="/stations/pending-review" element={<ProtectedRoute><ReviewPendingChangesPage /></ProtectedRoute>} />
-                <Route path="/stations/new" element={<ProtectedRoute><NewStationPage /></ProtectedRoute>} />
+                <Route path="/stations" element={<ProtectedRoute requireFullAdmin><StationsPageRefactored /></ProtectedRoute>} />
+                <Route path="/stations/edit" element={<ProtectedRoute requireFullAdmin><StationsPageRefactored initialMode="edit" /></ProtectedRoute>} />
+                <Route path="/stations/pending-review" element={<ProtectedRoute requireFullAdmin><ReviewPendingChangesPage /></ProtectedRoute>} />
+                <Route path="/stations/new" element={<ProtectedRoute requireFullAdmin><NewStationPage /></ProtectedRoute>} />
                 <Route path="/stations/:network/:stationSlug" element={<StationDetailsPage mode="view" />} />
-                <Route path="/stations/:network/:stationSlug/edit" element={<ProtectedRoute><StationDetailsPage mode="edit" /></ProtectedRoute>} />
-                <Route path="/stations/:legacyStationId/edit" element={<ProtectedRoute><LegacyStationRedirect mode="edit" /></ProtectedRoute>} />
+                <Route path="/stations/:network/:stationSlug/edit" element={<ProtectedRoute requireFullAdmin><StationDetailsPage mode="edit" /></ProtectedRoute>} />
+                <Route path="/stations/:legacyStationId/edit" element={<ProtectedRoute requireFullAdmin><LegacyStationRedirect mode="edit" /></ProtectedRoute>} />
                 <Route path="/stations/:legacyStationId" element={<LegacyStationRedirect mode="view" />} />
                 <Route path="/migration" element={<MigrationPage />} />
                 <Route path="/buttons" element={<ButtonsPage />} />
-                <Route path="/design-system" element={<ProtectedRoute><DesignSystemHomePage /></ProtectedRoute>} />
-                <Route path="/design-system/colours" element={<ProtectedRoute><ColoursPage /></ProtectedRoute>} />
-                <Route path="/design-system/typography" element={<ProtectedRoute><TypographyPage /></ProtectedRoute>} />
-                <Route path="/design-system/buttons" element={<ProtectedRoute><ButtonsPage /></ProtectedRoute>} />
-                <Route path="/design-system/layout" element={<ProtectedRoute><LayoutPage /></ProtectedRoute>} />
-                <Route path="/design-system/components" element={<ProtectedRoute><ComponentsPage /></ProtectedRoute>} />
-                <Route path="/design-system/icons" element={<ProtectedRoute><IconsPage /></ProtectedRoute>} />
-                <Route path="/design-system/heros" element={<ProtectedRoute><HerosPage /></ProtectedRoute>} />
-                <Route path="/admin/messages" element={<ProtectedRoute><MessageCentreDashboardPage /></ProtectedRoute>} />
-                <Route path="/admin/messages/new" element={<ProtectedRoute><MessageCentreAdminPage /></ProtectedRoute>} />
-                <Route path="/admin/messages/:messageId" element={<ProtectedRoute><MessageCentreAdminPage /></ProtectedRoute>} />
+                <Route path="/design-system" element={<ProtectedRoute requireFullAdmin><DesignSystemHomePage /></ProtectedRoute>} />
+                <Route path="/design-system/colours" element={<ProtectedRoute requireFullAdmin><ColoursPage /></ProtectedRoute>} />
+                <Route path="/design-system/typography" element={<ProtectedRoute requireFullAdmin><TypographyPage /></ProtectedRoute>} />
+                <Route path="/design-system/buttons" element={<ProtectedRoute requireFullAdmin><ButtonsPage /></ProtectedRoute>} />
+                <Route path="/design-system/layout" element={<ProtectedRoute requireFullAdmin><LayoutPage /></ProtectedRoute>} />
+                <Route path="/design-system/components" element={<ProtectedRoute requireFullAdmin><ComponentsPage /></ProtectedRoute>} />
+                <Route path="/design-system/icons" element={<ProtectedRoute requireFullAdmin><IconsPage /></ProtectedRoute>} />
+                <Route path="/design-system/heros" element={<ProtectedRoute requireFullAdmin><HerosPage /></ProtectedRoute>} />
+                <Route path="/admin/messages" element={<ProtectedRoute requireFullAdmin><MessageCentreDashboardPage /></ProtectedRoute>} />
+                <Route path="/admin/messages/new" element={<ProtectedRoute requireFullAdmin><MessageCentreAdminPage /></ProtectedRoute>} />
+                <Route path="/admin/messages/:messageId" element={<ProtectedRoute requireFullAdmin><MessageCentreAdminPage /></ProtectedRoute>} />
                 <Route path="/departures" element={<DarwinDeparturesPage />} />
                 <Route path="/departures/:code" element={<DarwinDeparturesPage />} />
                 <Route path="/services/:rid" element={<ServiceDetailPage />} />
                 <Route path="/units" element={<UnitsInServicePage />} />
                 <Route path="/units/:unitId" element={<UnitLookupPage />} />
-                <Route path="/api-status" element={<ProtectedRoute><ApiStatusPage /></ProtectedRoute>} />
+                <Route path="/bash" element={<ProtectedRoute requireDarwinTools><BashPlannerPage /></ProtectedRoute>} />
+                <Route path="/api-status" element={<ProtectedRoute requireDarwinTools><ApiStatusPage /></ProtectedRoute>} />
                 <Route path="/privacy" element={<PrivacyPolicyPage />} />
                 <Route path="/eula" element={<EulaPage />} />
                 <Route path="*" element={<NotFoundPage />} />

@@ -1,6 +1,7 @@
 import React, { useEffect, useId } from 'react'
 import { useLocation } from 'react-router-dom'
 import { useAuth } from '../../../contexts/AuthContext'
+import { isDarwinPreviewUser } from '../../../utils/darwinPreviewAccess'
 import { BUTHeaderLink } from '../../buttons'
 import BetaTag from '../BetaTag/BetaTag'
 import './Header.css'
@@ -28,12 +29,15 @@ function getHeaderPageTitle(pathname: string): string {
   if (pathname.startsWith('/design-system')) return 'Design system'
   if (pathname.startsWith('/admin/messages')) return 'Messages'
   if (pathname.startsWith('/units')) return 'Units'
+  if (pathname.startsWith('/bash')) return 'Bash'
+  if (pathname.startsWith('/departures') || pathname.startsWith('/services')) return 'Departures'
   if (pathname.startsWith('/api-status')) return 'API Status'
   return 'Rail Statistics'
 }
 
 const Header: React.FC = () => {
   const { user } = useAuth()
+  const darwinPreview = isDarwinPreviewUser(user)
   const { pathname } = useLocation()
   const mobileNavId = useId()
   /** Don’t stack “log-in → migration” in history, or browser Back from migration returns to login. */
@@ -47,14 +51,23 @@ const Header: React.FC = () => {
   const isMapActive = pathname === '/stations/map'
   const isMessagesActive = pathname.startsWith('/admin/messages')
 
+  const isDeparturesActive = pathname.startsWith('/departures') || pathname.startsWith('/services')
+  const isUnitsActive = pathname.startsWith('/units')
+  const isBashActive = pathname.startsWith('/bash')
+  const isApiStatusActive = pathname.startsWith('/api-status')
+
   const pageTitle = getHeaderPageTitle(pathname)
 
   const navItems = [
-    { to: '/home' as const, label: 'Home', active: isHomeActive, show: true, showBeta: false },
-    { to: '/migration' as const, label: 'Migration', active: isMigrationActive, show: true, showBeta: false },
-    { to: '/stations' as const, label: 'Stations', active: isStationsActive && !isMapActive, show: Boolean(user), showBeta: false },
-    { to: '/stations/map' as const, label: 'Map', active: isMapActive, show: true, showBeta: true },
-    { to: '/admin/messages' as const, label: 'Messages', active: isMessagesActive, show: Boolean(user), showBeta: false },
+    { to: '/home' as const, label: 'Home', active: isHomeActive, show: !darwinPreview, showBeta: false },
+    { to: '/migration' as const, label: 'Migration', active: isMigrationActive, show: !darwinPreview, showBeta: false },
+    { to: '/departures' as const, label: 'Departures', active: isDeparturesActive, show: darwinPreview, showBeta: false },
+    { to: '/units' as const, label: 'Units', active: isUnitsActive, show: darwinPreview, showBeta: false },
+    { to: '/bash' as const, label: 'Bash', active: isBashActive, show: darwinPreview, showBeta: false },
+    { to: '/api-status' as const, label: 'API Status', active: isApiStatusActive, show: darwinPreview, showBeta: false },
+    { to: '/stations' as const, label: 'Stations', active: isStationsActive && !isMapActive, show: Boolean(user) && !darwinPreview, showBeta: false },
+    { to: '/stations/map' as const, label: 'Map', active: isMapActive, show: !darwinPreview, showBeta: true },
+    { to: '/admin/messages' as const, label: 'Messages', active: isMessagesActive, show: Boolean(user) && !darwinPreview, showBeta: false },
   ].filter((item) => item.show)
 
   useEffect(() => {

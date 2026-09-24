@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { fetchDarwin } from '../../utils/darwinReadyFetch'
 import { PageTopHeader } from '../../components/misc'
-import { BUTWideButton, TOGToggleVisited } from '../../components/buttons'
+import { BUTWideButton } from '../../components/buttons'
 import './ApiStatusPage.css'
 
 type HealthPayload = {
@@ -68,8 +68,6 @@ type HealthPayload = {
     fileBytes?: number
     jsonFileBytes?: number
     store?: 'json' | 'sqlite'
-    jsonWrite?: boolean
-    sqliteWrite?: boolean
     sqlite?: {
       path?: string
       bytes?: number | null
@@ -168,7 +166,6 @@ const ApiStatusPage: React.FC = () => {
   const [error, setError] = useState<string | null>(null)
   const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null)
   const [available, setAvailable] = useState<HistoryDatesPayload | null>(null)
-  const [storeBusy, setStoreBusy] = useState(false)
 
   const runFetch = async (isInitial = false) => {
     if (isInitial) setStatus('loading')
@@ -196,25 +193,6 @@ const ApiStatusPage: React.FC = () => {
     } catch {}
   }
 
-  const patchStore = async (body: Record<string, unknown>) => {
-    setStoreBusy(true)
-    setError(null)
-    try {
-      const res = await fetchDarwin('/api/darwin/admin/state-store', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      })
-      const payload = await res.json().catch(() => null)
-      if (!res.ok) throw new Error(payload?.error || `HTTP ${res.status}`)
-      await runFetch(false)
-    } catch (e) {
-      setError((e as Error)?.message || 'Failed to update store.')
-    } finally {
-      setStoreBusy(false)
-    }
-  }
-
   useEffect(() => {
     runFetch(true)
     fetchAvailable()
@@ -225,9 +203,6 @@ const ApiStatusPage: React.FC = () => {
       window.clearInterval(a)
     }
   }, [])
-
-  const catalog = health?.unitCatalog
-  const sqliteOn = catalog?.store === 'sqlite'
 
   const summary = useMemo(() => {
     const stateBytes = pickNumber(health?.persistence?.fileSizeBytes, health?.persistence?.stateFileBytes)
@@ -306,7 +281,7 @@ const ApiStatusPage: React.FC = () => {
     <div className="api-status-shell">
       <PageTopHeader
         title="API Status"
-        subtitle={status === 'ok' ? 'Live Darwin daemon health, Kafka counters, and catalog store' : 'Connecting to API health...'}
+        subtitle={status === 'ok' ? 'Live Darwin daemon health and Kafka counters' : 'Connecting to API health...'}
       />
       <div className="api-status-page">
         <section className="api-status-controls">
@@ -318,71 +293,16 @@ const ApiStatusPage: React.FC = () => {
           {status === 'ok' && <p className="api-status-meta">Last update: {lastUpdatedAt ? displayDateTime(lastUpdatedAt) : '-'}</p>}
         </section>
 
-        <section className="api-panel" aria-label="Catalog store">
-          <h2>Catalog store</h2>
+        <section className="api-panel" aria-label="Unit catalog">
+          <h2>Unit catalog</h2>
           <p className="api-panel-subtitle">
-            Darwin keeps both copies on disk. SQLite is the compressed catalog; JSON is the rollback file.
-            Kafka live state still uses gzip shards — this toggle only changes how the unit catalog is loaded.
+            Stored in SQLite only. The old unit-catalog.json file may still be on disk as a backup and is not updated.
           </p>
-          <div className="api-store-toggles">
-            <label className="api-store-row">
-              <span>
-                Load catalog from SQLite
-                <small>Off = load JSON. On = load SQLite, fall back to JSON if it fails.</small>
-              </span>
-              <TOGToggleVisited
-                checked={sqliteOn}
-                disabled={storeBusy || status !== 'ok'}
-                ariaLabel="Load catalog from SQLite"
-                onChange={(next) => void patchStore({
-                  store: next ? 'sqlite' : 'json',
-                  jsonWrite: catalog?.jsonWrite !== false,
-                  sqliteWrite: catalog?.sqliteWrite !== false,
-                  reload: true,
-                })}
-              />
-            </label>
-            <label className="api-store-row">
-              <span>
-                Write JSON
-                <small>Keep unit-catalog.json updated so you can switch back.</small>
-              </span>
-              <TOGToggleVisited
-                checked={catalog?.jsonWrite !== false}
-                disabled={storeBusy || status !== 'ok'}
-                ariaLabel="Write JSON catalog"
-                onChange={(next) => void patchStore({
-                  store: catalog?.store || 'sqlite',
-                  jsonWrite: next,
-                  sqliteWrite: catalog?.sqliteWrite !== false,
-                  reload: false,
-                })}
-              />
-            </label>
-            <label className="api-store-row">
-              <span>
-                Write SQLite
-                <small>Keep darwin-state.sqlite updated.</small>
-              </span>
-              <TOGToggleVisited
-                checked={catalog?.sqliteWrite !== false}
-                disabled={storeBusy || status !== 'ok'}
-                ariaLabel="Write SQLite catalog"
-                onChange={(next) => void patchStore({
-                  store: catalog?.store || 'json',
-                  jsonWrite: catalog?.jsonWrite !== false,
-                  sqliteWrite: next,
-                  reload: false,
-                })}
-              />
-            </label>
-          </div>
           <div className="api-status-grid">
-            <Card title="Active read">{sqliteOn ? 'SQLite' : 'JSON'}</Card>
+            <Card title="Store">SQLite</Card>
             <Card title="Last load source">{summary.lastLoadSource}</Card>
             <Card title="Last load time">{summary.lastLoadMs}</Card>
             <Card title="Fell back">{summary.lastLoadFallback}</Card>
-            <Card title="JSON file">{summary.unitCatalogFileSize}</Card>
             <Card title="SQLite file">{summary.sqliteFileSize}</Card>
             <Card title="SQLite blob">{summary.sqliteBlobSize}</Card>
             <Card title="Catalog units">{summary.unitCatalog}</Card>
@@ -443,13 +363,12 @@ const ApiStatusPage: React.FC = () => {
 
         <section className="api-panel" aria-label="Cache file details">
           <h2>Cache files</h2>
-          <p className="api-panel-subtitle">On-disk footprint for the live state cache and both catalog copies.</p>
+          <p className="api-panel-subtitle">On-disk footprint for live state and the SQLite unit catalog. unit-catalog.json is a leftover backup if present.</p>
           <div className="api-status-grid">
             <Card title="State cache filename">{summary.stateCacheFileName}</Card>
-            <Card title="Unit catalog JSON">{summary.unitCatalogFileName}</Card>
             <Card title="State cache file">{summary.stateCacheFileSize}</Card>
-            <Card title="Unit catalog JSON size">{summary.unitCatalogFileSize}</Card>
             <Card title="SQLite catalog">{summary.sqliteFileSize}</Card>
+            <Card title="Leftover JSON backup">{summary.unitCatalogFileSize}</Card>
           </div>
         </section>
 

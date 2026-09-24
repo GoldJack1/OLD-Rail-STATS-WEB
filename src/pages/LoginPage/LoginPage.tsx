@@ -23,7 +23,7 @@ import {
 import { BUTWideButton } from '../../components/buttons'
 import { MFA_AUTOFILL, MFA_OTP_INPUT_NAME } from '../../constants/mfaAutofill'
 import './LoginPage.css'
-import TXTINPWideButton from '../../components/textInputs/plain/TXTINPWideButton'
+import { postLoginPath } from '../../utils/darwinPreviewAccess'
 
 type LoginStep = 'credentials' | 'verify-email' | 'checking-session' | 'totp-signin' | 'totp-enroll'
 
@@ -85,7 +85,7 @@ const LoginPage: React.FC = () => {
         return
       }
 
-      navigate('/stations', { replace: true })
+      navigate(postLoginPath(u), { replace: true })
     }
 
     void run()
@@ -176,7 +176,7 @@ const LoginPage: React.FC = () => {
           return
         }
 
-        navigate('/stations', { replace: true })
+        navigate(postLoginPath(u), { replace: true })
       } catch (err: unknown) {
         if (isMultiFactorAuthRequiredError(err)) {
           const resolver = getMultiFactorResolver(auth, err as MultiFactorError)
@@ -229,7 +229,7 @@ const LoginPage: React.FC = () => {
       mfaResolverRef.current = null
       setTotpSignInCode('')
       setStep('checking-session')
-      navigate('/stations', { replace: true })
+      navigate(postLoginPath(getFirebaseAuth()?.currentUser), { replace: true })
     } catch (err) {
       setError(mapTotpMfaError(err))
     } finally {
@@ -259,7 +259,7 @@ const LoginPage: React.FC = () => {
       setTotpQrDataUrl(null)
       setTotpSecretKeyDisplay(null)
       await reload(u)
-      navigate('/stations', { replace: true })
+      navigate(postLoginPath(u), { replace: true })
     } catch (err) {
       setError(mapTotpMfaError(err))
     } finally {
@@ -300,7 +300,7 @@ const LoginPage: React.FC = () => {
       if (userMustEnrollTotpMfaOnFirebase(u)) {
         setStep('totp-enroll')
       } else {
-        navigate('/stations', { replace: true })
+        navigate(postLoginPath(u), { replace: true })
       }
     } catch (err) {
       setError(mapEmailAuthError(err))

@@ -7,23 +7,19 @@
  * same in-memory Map after load). Row-per-service tables were larger than JSON.
  *
  * Env:
- *   DARWIN_STATE_STORE     json | sqlite   (read primary, default json)
- *   DARWIN_JSON_WRITE      default true
- *   DARWIN_SQLITE_WRITE    default true
  *   DARWIN_SQLITE_PATH     default state/darwin-state.sqlite
+ * Unit catalog is SQLite-only. unit-catalog.json is not written; it may still
+ * be read if sqlite load fails.
  */
 import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { gzipSync, gunzipSync } from 'node:zlib';
 
 export function parseStoreEnv() {
-  const store = String(process.env.DARWIN_STATE_STORE || 'json').toLowerCase();
-  const jsonWrite = !['0', 'false', 'no'].includes(String(process.env.DARWIN_JSON_WRITE ?? 'true').toLowerCase());
-  const sqliteWrite = !['0', 'false', 'no'].includes(String(process.env.DARWIN_SQLITE_WRITE ?? 'true').toLowerCase());
   return {
-    store: store === 'sqlite' ? 'sqlite' : 'json',
-    jsonWrite,
-    sqliteWrite,
+    store: 'sqlite',
+    jsonWrite: false,
+    sqliteWrite: true,
   };
 }
 

@@ -1,6 +1,7 @@
 import { useCallback, useSyncExternalStore } from 'react'
 import { useLocation } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
+import { isDarwinPreviewUser } from '../utils/darwinPreviewAccess'
 import {
   isStationAdminModeActive,
   STATION_ADMIN_MODE_CHANGED_EVENT,
@@ -21,5 +22,6 @@ export function useStationAdminMode(): boolean {
   const adminActive = useSyncExternalStore(subscribe, getSnapshot, () => false)
 
   if (loading || !user) return false
+  if (isDarwinPreviewUser(user)) return false
   return adminActive
 }

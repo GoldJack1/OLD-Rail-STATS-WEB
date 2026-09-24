@@ -62,6 +62,14 @@ import { createRequire } from 'node:module';
 import dotenv from 'dotenv';
 import { Kafka, logLevel } from 'kafkajs';
 import { flushJidxWriteQueue, loadAllJourneysIndexedByTiploc } from './timetable-loader.mjs';
+import {
+  appendHistoryManifestSnap,
+  attachHeavyFromManifestSnap,
+  blobBasenames,
+  manifestSnapsToList,
+  readHistoryManifest,
+  writeCoreBlob,
+} from './history-manifest.mjs';
 import { buildPlannerIndex, planBashItinerary } from './bash-planner.mjs';
 import { expandTtisDay, loadTtisIndex } from './cif-ttis-loader.mjs';
 import { loadTodaysReasons } from './reasons-loader.mjs';
@@ -878,6 +886,11 @@ async function reloadAllDataAndResetLive(reason = 'manual') {
         `[daemon] ${reason}: keeping PTAC/consist/units/formations (often published 12–48h before the working day).`
       );
     } else {
+      try {
+        persistActualsArchive(loadedDate || railwayDayYmd(new Date()), serializeLiveOverlayEntries());
+      } catch (e) {
+        console.warn(`[daemon] actuals archive before prune failed: ${e.message}`);
+      }
       stationMessages.clear();
       messagesById.clear();
       pruneMapsToValidRids();
@@ -1018,18 +1031,28 @@ let STORE_ENV = parseStoreEnv();
 let sqliteHandle = null;
 let sqliteInitError = null;
 let lastCatalogLoad = { source: null, ms: null, at: null, fallback: false };
+let catalogLoadBySource = { json: null, sqlite: null };
+
+function catalogProcessMem() {
+  const m = process.memoryUsage();
+  return {
+    heapMB: +(m.heapUsed / 1024 / 1024).toFixed(1),
+    rssMB: +(m.rss / 1024 / 1024).toFixed(1),
+  };
+}
+
+function recordCatalogSourceLoad(source, extra = {}) {
+  catalogLoadBySource[source] = {
+    source,
+    at: new Date().toISOString(),
+    ...catalogProcessMem(),
+    ...extra,
+  };
+}
 
 function applyStoreOverrideFile() {
-  if (!existsSync(STORE_OVERRIDE_FILE)) return;
-  try {
-    const raw = JSON.parse(readFileSync(STORE_OVERRIDE_FILE, 'utf8'));
-    if (raw.store === 'json' || raw.store === 'sqlite') STORE_ENV.store = raw.store;
-    if (typeof raw.jsonWrite === 'boolean') STORE_ENV.jsonWrite = raw.jsonWrite;
-    if (typeof raw.sqliteWrite === 'boolean') STORE_ENV.sqliteWrite = raw.sqliteWrite;
-    console.log(`[daemon] store override: read=${STORE_ENV.store} jsonWrite=${STORE_ENV.jsonWrite} sqliteWrite=${STORE_ENV.sqliteWrite}`);
-  } catch (e) {
-    console.warn(`[daemon] store override ignored: ${e.message}`);
-  }
+  STORE_ENV = parseStoreEnv();
+  console.log('[daemon] unit catalog: sqlite only (JSON file not written)');
 }
 applyStoreOverrideFile();
 
@@ -1037,9 +1060,9 @@ function persistStoreOverride() {
   try {
     if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true });
     const payload = {
-      store: STORE_ENV.store,
-      jsonWrite: STORE_ENV.jsonWrite,
-      sqliteWrite: STORE_ENV.sqliteWrite,
+      store: 'sqlite',
+      jsonWrite: false,
+      sqliteWrite: true,
       savedAt: new Date().toISOString(),
     };
     const tmp = STORE_OVERRIDE_FILE + '.tmp';
@@ -1064,6 +1087,7 @@ function storeSnapshot() {
     jsonFileBytes: fileSizeBytes(UNIT_CATALOG_FILE),
     sqlite: sqliteStats,
     lastLoad: lastCatalogLoad,
+    loadBySource: catalogLoadBySource,
   };
 }
 const PERSIST_INTERVAL_SEC = Number(process.env.PERSIST_INTERVAL_SEC || 30);
@@ -1081,6 +1105,16 @@ const STATE_HISTORY_GZIP_LEVEL = Math.max(1, Math.min(9, Number(process.env.STAT
 const STATE_HEAVY_GZIP_LEVEL = Math.max(1, Math.min(9, Number(process.env.STATE_HEAVY_GZIP_LEVEL || STATE_HISTORY_GZIP_LEVEL)));
 /** Content-addressed heavy shards: gzip once per unique payload, hard-link 30s snapshot names to the blob. */
 const STATE_HISTORY_DEDUP_SHARDS = !['0', 'false', 'no'].includes(String(process.env.STATE_HISTORY_DEDUP_SHARDS || 'true').toLowerCase());
+/** Persist 30s points into manifest.json + blobs/ (keep interval; stop extra stamped names by default). */
+const STATE_HISTORY_MANIFEST = !['0', 'false', 'no'].includes(String(process.env.STATE_HISTORY_MANIFEST || 'true').toLowerCase());
+/** Also write daemon-cache.<stamp> + heavy names (legacy). Off once the loader reads the manifest. */
+const STATE_HISTORY_STAMPED_NAMES = ['1', 'true', 'yes'].includes(String(process.env.STATE_HISTORY_STAMPED_NAMES || 'false').toLowerCase());
+const HISTORY_EXCLUDE_DATES = new Set(
+  String(process.env.HISTORY_EXCLUDE_DATES || '2026-09-20')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => /^\d{4}-\d{2}-\d{2}$/.test(s)),
+);
 /** Max uncompressed JSON chars per heavy gzip part. Must stay under V8's ~512MB string cap. */
 const STATE_HEAVY_JSON_MAX_CHARS = Math.max(8 * 1024 * 1024, Number(process.env.STATE_HEAVY_JSON_MAX_CHARS || 120 * 1024 * 1024));
 const HEAVY_SHARD_LABELS = ['formations', 'consist', 'units', 'overlay'];
@@ -1225,6 +1259,25 @@ function availableHistoryDates() {
   let entries = [];
   try { entries = readdirSync(STATE_HISTORY_DIR); } catch { return []; }
   return entries.filter((d) => isIsoDate(d)).sort().reverse();
+}
+
+function availableTimetableIsoDates() {
+  const ttRoot = resolve(__dirname, './tt');
+  let entries = [];
+  try { entries = readdirSync(ttRoot); } catch { return []; }
+  const out = [];
+  for (const d of entries) {
+    if (!/^\d{8}$/.test(d)) continue;
+    out.push(`${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`);
+  }
+  return out;
+}
+
+function knownBoardDates() {
+  return [...new Set([...availableHistoryDates(), ...availableTimetableIsoDates()])]
+    .filter((d) => !HISTORY_EXCLUDE_DATES.has(d))
+    .sort()
+    .reverse();
 }
 
 function pruneHistoryDirsByRetention() {
@@ -1803,6 +1856,127 @@ function serializeLiveOverlayEntries() {
   ]);
 }
 
+function isActualLiveKind(kind) {
+  return typeof kind === 'string' && kind.startsWith('actual');
+}
+
+function locActualSlice(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  const out = {};
+  if (isActualLiveKind(entry.bestKind) && entry.bestTime) {
+    out.bestTime = entry.bestTime;
+    out.bestKind = entry.bestKind;
+    if (entry.liveSource) out.liveSource = entry.liveSource;
+    if (entry.liveSourceInstance) out.liveSourceInstance = entry.liveSourceInstance;
+  }
+  if (isActualLiveKind(entry.arrLiveKind) && entry.arrLiveTime) {
+    out.arrLiveTime = entry.arrLiveTime;
+    out.arrLiveKind = entry.arrLiveKind;
+    if (entry.arrLiveSource) out.arrLiveSource = entry.arrLiveSource;
+    if (entry.arrLiveSourceInstance) out.arrLiveSourceInstance = entry.arrLiveSourceInstance;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+function extractActualsFromOverlayEntries(overlayEntries) {
+  const rids = {};
+  if (!Array.isArray(overlayEntries)) return rids;
+  for (const pair of overlayEntries) {
+    const rid = pair?.[0];
+    const ov = pair?.[1];
+    if (!rid || !ov) continue;
+    const locs = Array.isArray(ov.locs) ? ov.locs : [];
+    const locMap = {};
+    for (const locPair of locs) {
+      const tpl = locPair?.[0];
+      const slice = locActualSlice(locPair?.[1]);
+      if (tpl && slice) locMap[String(tpl).toUpperCase()] = slice;
+    }
+    if (Object.keys(locMap).length) rids[rid] = locMap;
+  }
+  return rids;
+}
+
+function mergeActualsMaps(into, from) {
+  for (const [rid, locs] of Object.entries(from || {})) {
+    if (!into[rid]) into[rid] = {};
+    for (const [tpl, slice] of Object.entries(locs || {})) {
+      const prev = into[rid][tpl] || {};
+      const next = { ...prev };
+      if (isActualLiveKind(slice.bestKind) && slice.bestTime) {
+        next.bestTime = slice.bestTime;
+        next.bestKind = slice.bestKind;
+        if (slice.liveSource) next.liveSource = slice.liveSource;
+        if (slice.liveSourceInstance) next.liveSourceInstance = slice.liveSourceInstance;
+      }
+      if (isActualLiveKind(slice.arrLiveKind) && slice.arrLiveTime) {
+        next.arrLiveTime = slice.arrLiveTime;
+        next.arrLiveKind = slice.arrLiveKind;
+        if (slice.arrLiveSource) next.arrLiveSource = slice.arrLiveSource;
+        if (slice.arrLiveSourceInstance) next.arrLiveSourceInstance = slice.arrLiveSourceInstance;
+      }
+      into[rid][tpl] = next;
+    }
+  }
+}
+
+function actualsArchivePath(ymdDashed) {
+  return resolve(STATE_HISTORY_DIR, ymdDashed, 'actuals.json.gz');
+}
+
+function loadActualsArchive(ymdDashed) {
+  const p = actualsArchivePath(ymdDashed);
+  if (!existsSync(p)) return {};
+  try {
+    const parsed = JSON.parse(gunzipSync(readFileSync(p)).toString('utf8'));
+    return parsed?.rids && typeof parsed.rids === 'object' ? parsed.rids : {};
+  } catch {
+    return {};
+  }
+}
+
+function persistActualsArchive(ymdDashed, overlayEntries) {
+  if (!isIsoDate(ymdDashed)) return;
+  const extracted = extractActualsFromOverlayEntries(overlayEntries);
+  const existingPath = actualsArchivePath(ymdDashed);
+  if (!Object.keys(extracted).length && !existsSync(existingPath)) return;
+  const dayDir = resolve(STATE_HISTORY_DIR, ymdDashed);
+  if (!existsSync(dayDir)) mkdirSync(dayDir, { recursive: true });
+  const merged = loadActualsArchive(ymdDashed);
+  mergeActualsMaps(merged, extracted);
+  const tmp = existingPath + '.tmp';
+  writeFileSync(tmp, gzipSync(JSON.stringify({ savedAt: new Date().toISOString(), rids: merged }), { level: STATE_HISTORY_GZIP_LEVEL }));
+  renameSync(tmp, existingPath);
+}
+
+function applyActualsToOverlayEntries(overlayEntries, actualsRids) {
+  if (!actualsRids || !Object.keys(actualsRids).length) return overlayEntries || [];
+  const byRid = new Map(Array.isArray(overlayEntries) ? overlayEntries : []);
+  for (const [rid, locs] of Object.entries(actualsRids)) {
+    const ov = byRid.get(rid) || { locs: [] };
+    const locMap = new Map(Array.isArray(ov.locs) ? ov.locs : []);
+    for (const [tpl, slice] of Object.entries(locs || {})) {
+      const prev = locMap.get(tpl) || {};
+      const next = { ...prev };
+      if (isActualLiveKind(slice.bestKind) && !isActualLiveKind(next.bestKind)) {
+        next.bestTime = slice.bestTime;
+        next.bestKind = slice.bestKind;
+        if (slice.liveSource) next.liveSource = slice.liveSource;
+        if (slice.liveSourceInstance) next.liveSourceInstance = slice.liveSourceInstance;
+      }
+      if (isActualLiveKind(slice.arrLiveKind) && !isActualLiveKind(next.arrLiveKind)) {
+        next.arrLiveTime = slice.arrLiveTime;
+        next.arrLiveKind = slice.arrLiveKind;
+        if (slice.arrLiveSource) next.arrLiveSource = slice.arrLiveSource;
+        if (slice.arrLiveSourceInstance) next.arrLiveSourceInstance = slice.arrLiveSourceInstance;
+      }
+      locMap.set(tpl, next);
+    }
+    byRid.set(rid, { ...ov, locs: [...locMap.entries()] });
+  }
+  return [...byRid.entries()];
+}
+
 function restoreLiveOverlayEntries(entries) {
   if (!Array.isArray(entries)) return;
   for (const [rid, ov] of entries) {
@@ -2037,24 +2211,24 @@ function listHistorySnapshotsForDate(ymdDashed) {
   const now = Date.now();
   const cached = historySnapshotListCache.get(ymdDashed);
   if (cached && now - (cached.loadedAtMs || 0) <= HIST_SNAPSHOT_LIST_CACHE_TTL_MS) return cached.list;
-  // Phase 4: prefer the disk-backed snapshot-index.json. It's much cheaper
-  // than scanning the directory on dates with hundreds of snapshot files.
+  const dayDir = resolve(STATE_HISTORY_DIR, ymdDashed);
+  const blobDir = heavyShardBlobDir(ymdDashed);
+  const byMs = new Map();
   const indexed = readSnapshotIndexForDate(ymdDashed);
-  if (indexed) {
-    historySnapshotListCache.set(ymdDashed, { loadedAtMs: now, list: indexed });
-    pruneHistorySnapshotListCache();
-    return indexed;
+  const fromDisk = indexed || snapshotsFromReaddir(ymdDashed);
+  for (const e of fromDisk) byMs.set(e.ms, e);
+  const manifest = readHistoryManifest(dayDir);
+  if (manifest?.snaps?.length) {
+    for (const e of manifestSnapsToList(dayDir, blobDir, manifest.snaps)) byMs.set(e.ms, e);
   }
-  // Fallback for dates that haven't been indexed yet — compute by readdir
-  // and build the index file so subsequent requests are fast.
-  const list = snapshotsFromReaddir(ymdDashed);
+  const list = [...byMs.values()].sort((a, b) => a.ms - b.ms);
   historySnapshotListCache.set(ymdDashed, { loadedAtMs: now, list });
   pruneHistorySnapshotListCache();
-  // Persist the index asynchronously so we don't add latency to the current
-  // request. Best-effort.
-  setImmediate(() => {
-    try { buildSnapshotIndexForDate(ymdDashed); } catch {}
-  });
+  if (!indexed) {
+    setImmediate(() => {
+      try { buildSnapshotIndexForDate(ymdDashed); } catch {}
+    });
+  }
   return list;
 }
 
@@ -2064,6 +2238,7 @@ function readHistoricalStateFile(corePath, heavyOpts = historicalHeavyOpts('boar
   const now = Date.now();
   const cacheKey = [
     corePath,
+    heavyOpts.manifestSnap?.ms || '',
     heavyOpts.skipFormations ? 'F0' : 'F1',
     heavyOpts.skipConsist ? 'C0' : 'C1',
     heavyOpts.skipUnits ? 'U0' : 'U1',
@@ -2078,7 +2253,11 @@ function readHistoricalStateFile(corePath, heavyOpts = historicalHeavyOpts('boar
     } else {
       raw = JSON.parse(readFileSync(corePath, 'utf8'));
     }
-    attachHeavyShards(raw, corePath, heavyOpts);
+    if (heavyOpts.manifestSnap && heavyOpts.blobDir) {
+      attachHeavyFromManifestSnap(raw, heavyOpts.blobDir, heavyOpts.manifestSnap, heavyOpts);
+    } else {
+      attachHeavyShards(raw, corePath, heavyOpts);
+    }
     historicalStateFileCache.set(cacheKey, { loadedAtMs: now, raw });
     if (historicalStateFileCache.size > HIST_STATE_FILE_CACHE_MAX) {
       const ordered = [...historicalStateFileCache.entries()].sort((a, b) => (a[1].loadedAtMs || 0) - (b[1].loadedAtMs || 0));
@@ -2184,9 +2363,15 @@ function applyUnitCatalogPayload(raw, source) {
 
 function loadUnitCatalogFromJson() {
   if (!existsSync(UNIT_CATALOG_FILE)) return false;
+  const t0 = Date.now();
   try {
     const raw = JSON.parse(readFileSync(UNIT_CATALOG_FILE, 'utf8'));
     applyUnitCatalogPayload(raw, 'json');
+    recordCatalogSourceLoad('json', {
+      ms: Date.now() - t0,
+      units: unitCatalogById.size,
+      bytes: fileSizeBytes(UNIT_CATALOG_FILE),
+    });
     return true;
   } catch (e) {
     console.warn(`[daemon] failed to load unit catalog JSON: ${e.message}`);
@@ -2196,10 +2381,18 @@ function loadUnitCatalogFromJson() {
 
 function loadUnitCatalogFromSqlite() {
   if (!sqliteHandle) return false;
+  const t0 = Date.now();
   try {
     const raw = sqliteHandle.loadCatalog();
     if (!raw) return false;
     applyUnitCatalogPayload(raw, 'sqlite');
+    const st = sqliteHandle.stats();
+    recordCatalogSourceLoad('sqlite', {
+      ms: Date.now() - t0,
+      units: unitCatalogById.size,
+      bytes: st.bytes,
+      blobBytes: st.blobBytes,
+    });
     return true;
   } catch (e) {
     console.warn(`[daemon] failed to load unit catalog sqlite: ${e.message}`);
@@ -2210,21 +2403,11 @@ function loadUnitCatalogFromSqlite() {
 function loadUnitCatalog() {
   const t0 = Date.now();
   lastCatalogLoad.fallback = false;
-  let ok = false;
-  if (STORE_ENV.store === 'sqlite') {
-    ok = loadUnitCatalogFromSqlite();
-    if (!ok) {
-      console.warn('[daemon] sqlite catalog empty or failed; falling back to JSON');
-      lastCatalogLoad.fallback = true;
-      ok = loadUnitCatalogFromJson();
-    }
-  } else {
+  let ok = loadUnitCatalogFromSqlite();
+  if (!ok) {
+    console.warn('[daemon] sqlite catalog empty or failed; falling back to JSON file');
+    lastCatalogLoad.fallback = true;
     ok = loadUnitCatalogFromJson();
-    if (!ok) {
-      console.warn('[daemon] JSON catalog missing; loaded sqlite');
-      lastCatalogLoad.fallback = true;
-      ok = loadUnitCatalogFromSqlite();
-    }
   }
   lastCatalogLoad.ms = Date.now() - t0;
   if (!ok) lastCatalogLoad.source = lastCatalogLoad.source || 'none';
@@ -2242,26 +2425,53 @@ async function ensureSqliteHandle() {
   return false;
 }
 
-async function applyStateStoreConfig(next) {
-  if (next.store === 'json' || next.store === 'sqlite') STORE_ENV.store = next.store;
-  if (typeof next.jsonWrite === 'boolean') STORE_ENV.jsonWrite = next.jsonWrite;
-  if (typeof next.sqliteWrite === 'boolean') STORE_ENV.sqliteWrite = next.sqliteWrite;
-  if (STORE_ENV.sqliteWrite || STORE_ENV.store === 'sqlite') {
-    const opened = await ensureSqliteHandle();
-    if (!opened && STORE_ENV.store === 'sqlite') {
-      STORE_ENV.store = 'json';
-      lastCatalogLoad.fallback = true;
+function maybeGc() {
+  try { if (typeof globalThis.gc === 'function') globalThis.gc(); } catch {}
+}
+
+function benchmarkCatalogStores() {
+  const compared = { json: null, sqlite: null };
+  maybeGc();
+  if (existsSync(UNIT_CATALOG_FILE)) {
+    const t0 = Date.now();
+    try {
+      const raw = JSON.parse(readFileSync(UNIT_CATALOG_FILE, 'utf8'));
+      const units = Array.isArray(raw.units) ? raw.units.length : 0;
+      compared.json = {
+        source: 'json',
+        at: new Date().toISOString(),
+        ms: Date.now() - t0,
+        units,
+        bytes: fileSizeBytes(UNIT_CATALOG_FILE),
+        ...catalogProcessMem(),
+      };
+      catalogLoadBySource.json = compared.json;
+    } catch (e) {
+      compared.json = { error: e.message };
     }
   }
-  persistStoreOverride();
-  let reloaded = false;
-  if (next.reload) {
-    unitCatalogById.clear();
-    unitsCatalogCache = { at: 0, payload: null };
-    loadUnitCatalog();
-    reloaded = true;
+  maybeGc();
+  if (sqliteHandle) {
+    const t0 = Date.now();
+    try {
+      const raw = sqliteHandle.loadCatalog();
+      const units = raw?.units?.length || 0;
+      const st = sqliteHandle.stats();
+      compared.sqlite = {
+        source: 'sqlite',
+        at: new Date().toISOString(),
+        ms: Date.now() - t0,
+        units,
+        bytes: st.bytes,
+        blobBytes: st.blobBytes,
+        ...catalogProcessMem(),
+      };
+      catalogLoadBySource.sqlite = compared.sqlite;
+    } catch (e) {
+      compared.sqlite = { error: e.message };
+    }
   }
-  return { ...storeSnapshot(), reloaded, catalogSize: unitCatalogById.size };
+  return compared;
 }
 
 function mergeUnitIntoCatalog(unitEntry) {
@@ -2316,16 +2526,7 @@ function persistUnitCatalog() {
     pruneUnitCatalogStaleDays();
     if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true });
     const savedAt = new Date().toISOString();
-    if (STORE_ENV.jsonWrite) {
-      const payload = {
-        savedAt,
-        units: [...unitCatalogById.entries()],
-      };
-      const tmp = UNIT_CATALOG_FILE + '.tmp';
-      writeFileSync(tmp, JSON.stringify(payload));
-      renameSync(tmp, UNIT_CATALOG_FILE);
-    }
-    if (STORE_ENV.sqliteWrite && sqliteHandle) {
+    if (sqliteHandle) {
       try {
         sqliteHandle.saveCatalog(unitCatalogById, savedAt);
       } catch (e) {
@@ -2342,24 +2543,33 @@ function historyFileForDate(ymdDashed) {
   return resolve(STATE_HISTORY_DIR, ymdDashed, 'daemon-cache.latest.json');
 }
 
+function historyDayHasState(ymdDashed) {
+  return existsSync(historyFileForDate(ymdDashed))
+    || existsSync(resolve(STATE_HISTORY_DIR, ymdDashed, 'manifest.json'));
+}
+
 function loadPersistedStateForDate(ymdDashed, at = null) {
-  if (!isIsoDate(ymdDashed)) return null;
-  const candidates = [];
+  if (!isIsoDate(ymdDashed) || HISTORY_EXCLUDE_DATES.has(ymdDashed)) return null;
   const atMin = parseAtToMinutes(at);
   if (at && atMin != null) {
     const snaps = listHistorySnapshotsForDate(ymdDashed);
     const cutoff = Date.parse(`${ymdDashed}T${String(Math.floor(atMin / 60)).padStart(2, '0')}:${String(atMin % 60).padStart(2, '0')}:59Z`);
-    // Phase 4: binary search the sorted-by-ms list instead of linear scan.
-    // Falls through to the latest snapshot if no snapshot is older than the
-    // requested cutoff (preserves previous behaviour).
     const pick = findSnapshotAtOrBefore(snaps, cutoff) || snaps[snaps.length - 1];
-    if (pick) candidates.push(pick.path);
+    if (pick?.path) {
+      const opts = historicalHeavyOpts('board');
+      if (pick.manifestSnap) {
+        opts.manifestSnap = pick.manifestSnap;
+        opts.blobDir = pick.blobDir || heavyShardBlobDir(ymdDashed);
+      }
+      const raw = readHistoricalStateFile(pick.path, opts);
+      if (raw) return raw;
+    }
   }
-  candidates.push(
+  const candidates = [
     historyFileForDate(ymdDashed),
     resolve(STATE_DIR, `daemon-cache.${ymdDashed}.json`),
     resolve(STATE_DIR, `daemon-cache.${ymdDashed}.json.gz`),
-  );
+  ];
   if (ymdDashed === loadedDate) candidates.unshift(STATE_FILE);
   for (const p of candidates) {
     const raw = readHistoricalStateFile(p, historicalHeavyOpts('board'));
@@ -2369,7 +2579,7 @@ function loadPersistedStateForDate(ymdDashed, at = null) {
 }
 
 async function getHistoricalContext(ymdDashed, at = null) {
-  if (!isIsoDate(ymdDashed)) return null;
+  if (!isIsoDate(ymdDashed) || HISTORY_EXCLUDE_DATES.has(ymdDashed)) return null;
   const cacheKey = `${ymdDashed}|${at || ''}`;
   const cached = historicalContextCache.get(cacheKey);
   if (cached && Date.now() - cached.loadedAtMs <= HIST_CONTEXT_CACHE_TTL_MS) return cached;
@@ -2383,14 +2593,22 @@ async function getHistoricalContext(ymdDashed, at = null) {
 }
 
 async function loadHistoricalContext(ymdDashed, at, cacheKey) {
-  const histTimetable = await getHistoricalTimetable(ymdDashed);
+  const [histTimetable, state] = await Promise.all([
+    getHistoricalTimetable(ymdDashed),
+    Promise.resolve().then(() => loadPersistedStateForDate(ymdDashed, at)),
+  ]);
   if (!histTimetable) return null;
   const histByRid = histTimetable.byRid;
   const histByTiploc = histTimetable.byTiploc;
-  const state = loadPersistedStateForDate(ymdDashed, at);
-  if (!state) return null;
+  if (!state) return getTimetableOnlyContext(ymdDashed, at);
+  let overlayEntries = state.liveOverlayByRid || [];
+  // Point-in-time (?at=) stays as the snapshot. Latest historical view fills
+  // in arrived/passed/departed from the day's accumulating actuals archive.
+  if (!at) {
+    overlayEntries = applyActualsToOverlayEntries(overlayEntries, loadActualsArchive(ymdDashed));
+  }
   console.log(
-    `[hist] ${ymdDashed}${at ? ` at=${at}` : ''} overlay=${Array.isArray(state.liveOverlayByRid) ? state.liveOverlayByRid.length : 0} `
+    `[hist] ${ymdDashed}${at ? ` at=${at}` : ''} overlay=${Array.isArray(overlayEntries) ? overlayEntries.length : 0} `
     + `formations=${Array.isArray(state.formations) ? state.formations.length : 0} consist=skipped units=skipped`
   );
 
@@ -2400,7 +2618,7 @@ async function loadHistoricalContext(ymdDashed, at, cacheKey) {
     historicalAt: at || null,
     byRid: histByRid,
     byTiploc: histByTiploc,
-    liveOverlayByRid: lazyLiveOverlay(state.liveOverlayByRid || []),
+    liveOverlayByRid: lazyLiveOverlay(overlayEntries),
     cancelled: toMap(state.cancelled || []),
     delayReason: toMap(state.delayReason || []),
     reverseFormation: new Set(state.reverseFormation || []),
@@ -2501,13 +2719,17 @@ async function getTimetableOnlyContext(ymdDashed, at = null) {
     byRidSrc = fromFile.byRid;
     byTiplocSrc = fromFile.byTiploc;
   }
+  let overlay = new Map();
+  if (!at) {
+    overlay = lazyLiveOverlay(applyActualsToOverlayEntries([], loadActualsArchive(ymdDashed)));
+  }
   return {
     loadedAtMs: Date.now(),
     historicalDate: ymdDashed,
     historicalAt: at || null,
     byRid: byRidSrc,
     byTiploc: byTiplocSrc,
-    liveOverlayByRid: new Map(),
+    liveOverlayByRid: overlay,
     cancelled: new Map(),
     delayReason: new Map(),
     reverseFormation: new Set(),
@@ -2668,7 +2890,11 @@ function persistWarmupProgress() {
 }
 
 async function primePastDay(ymd) {
-  const hasState = existsSync(historyFileForDate(ymd));
+  if (HISTORY_EXCLUDE_DATES.has(ymd)) {
+    console.log(`[boot] past ${ymd} skipped (excluded)`);
+    return { skipped: true };
+  }
+  const hasState = historyDayHasState(ymd);
   const hasTt = !!pickTimetableForDate(ymd);
   if (!hasState && !hasTt) {
     console.log(`[boot] past ${ymd} skipped (no data)`);
@@ -2677,10 +2903,11 @@ async function primePastDay(ymd) {
   const t0 = Date.now();
   if (hasTt) await getHistoricalTimetable(ymd);
   if (hasState) {
-    const snaps = listHistorySnapshotsForDate(ymd);
-    buildSnapshotIndexForDate(ymd);
     await getHistoricalContext(ymd);
-    console.log(`[boot] past ${ymd} primed in ${Date.now() - t0}ms (${snaps.length} snapshots)`);
+    setImmediate(() => {
+      try { buildSnapshotIndexForDate(ymd); } catch {}
+    });
+    console.log(`[boot] past ${ymd} primed in ${Date.now() - t0}ms`);
   } else {
     await getTimetableOnlyContext(ymd);
     console.log(`[boot] past ${ymd} timetable-only primed in ${Date.now() - t0}ms`);
@@ -2810,10 +3037,18 @@ async function persistState(opts = {}) {
 
     if (lastAutoFetchRunYmd) corePayload.lastAutoFetchRunYmd = lastAutoFetchRunYmd;
 
+    try {
+      persistActualsArchive(corePayload.savedDate, overlayEntries);
+    } catch (e) {
+      console.warn(`[daemon] actuals archive persist failed: ${e.message}`);
+    }
+
     if (!existsSync(STATE_HISTORY_DIR)) mkdirSync(STATE_HISTORY_DIR, { recursive: true });
     const dayDir = resolve(STATE_HISTORY_DIR, corePayload.savedDate);
     if (!existsSync(dayDir)) mkdirSync(dayDir, { recursive: true });
-    const blobDir = STATE_HISTORY_DEDUP_SHARDS ? heavyShardBlobDir(corePayload.savedDate) : null;
+    const blobDir = (STATE_HISTORY_DEDUP_SHARDS || STATE_HISTORY_MANIFEST)
+      ? heavyShardBlobDir(corePayload.savedDate)
+      : null;
     if (blobDir && !existsSync(blobDir)) mkdirSync(blobDir, { recursive: true });
 
     // Heavy gz shards first (formations, PTAC, units, live overlay), gzipped in
@@ -2850,26 +3085,47 @@ async function persistState(opts = {}) {
     renameSync(dayLatestTmp, dayLatest);
     await writeHeavy(heavyStemForCore(dayLatest));
 
-    const dayStamp = (corePayload.savedAt || savedAt).replace(/[:.]/g, '-');
-    const stampedStem = resolve(dayDir, `daemon-cache-heavy.${dayStamp}`);
-    if (STATE_HISTORY_COMPRESS_SNAPSHOTS) {
-      const daySnap = resolve(dayDir, `daemon-cache.${dayStamp}.json.gz`);
-      const daySnapTmp = daySnap + '.tmp';
+    if (STATE_HISTORY_MANIFEST && heavyBlobs) {
       try {
-        writeFileSync(daySnapTmp, gzipSync(coreJson, { level: STATE_HISTORY_GZIP_LEVEL }));
-        renameSync(daySnapTmp, daySnap);
-      } catch {}
-    } else {
-      const daySnap = resolve(dayDir, `daemon-cache.${dayStamp}.json`);
-      const daySnapTmp = daySnap + '.tmp';
+        const coreBlobName = writeCoreBlob(blobDir, coreJson, STATE_HISTORY_GZIP_LEVEL);
+        const ms = Date.parse(corePayload.savedAt || savedAt);
+        appendHistoryManifestSnap(dayDir, {
+          ms: Number.isFinite(ms) ? ms : Date.now(),
+          savedAt: corePayload.savedAt || savedAt,
+          date: corePayload.savedDate,
+          core: coreBlobName,
+          formations: blobBasenames(heavyBlobs.formations),
+          consist: blobBasenames(heavyBlobs.consist),
+          units: blobBasenames(heavyBlobs.units),
+          overlay: blobBasenames(heavyBlobs.overlay),
+        });
+      } catch (e) {
+        console.warn(`[daemon] history manifest persist failed: ${e.message}`);
+      }
+    }
+
+    if (STATE_HISTORY_STAMPED_NAMES) {
+      const dayStamp = (corePayload.savedAt || savedAt).replace(/[:.]/g, '-');
+      const stampedStem = resolve(dayDir, `daemon-cache-heavy.${dayStamp}`);
+      if (STATE_HISTORY_COMPRESS_SNAPSHOTS) {
+        const daySnap = resolve(dayDir, `daemon-cache.${dayStamp}.json.gz`);
+        const daySnapTmp = daySnap + '.tmp';
+        try {
+          writeFileSync(daySnapTmp, gzipSync(coreJson, { level: STATE_HISTORY_GZIP_LEVEL }));
+          renameSync(daySnapTmp, daySnap);
+        } catch {}
+      } else {
+        const daySnap = resolve(dayDir, `daemon-cache.${dayStamp}.json`);
+        const daySnapTmp = daySnap + '.tmp';
+        try {
+          writeFileSync(daySnapTmp, coreJson);
+          renameSync(daySnapTmp, daySnap);
+        } catch {}
+      }
       try {
-        writeFileSync(daySnapTmp, coreJson);
-        renameSync(daySnapTmp, daySnap);
+        await writeHeavy(stampedStem);
       } catch {}
     }
-    try {
-      await writeHeavy(stampedStem);
-    } catch {}
 
     pruneHistoryDirsByRetention();
     try { buildSnapshotIndexForDate(corePayload.savedDate); } catch {}
@@ -3953,9 +4209,9 @@ function getHistoryDatesLitePayload() {
   if (historyDatesLiteCache.payload && Date.now() - historyDatesLiteCache.at < 30_000) {
     return historyDatesLiteCache.payload;
   }
-  const dates = availableHistoryDates().map((d) => ({
+  const dates = knownBoardDates().map((d) => ({
     date: d,
-    hasState: existsSync(historyFileForDate(d)),
+    hasState: historyDayHasState(d),
     hasTimetable: !!pickTimetableForDate(d),
     snapshots: [],
   }));
@@ -4621,18 +4877,7 @@ async function handleRequest(req, res) {
       sendJson(res, 200, { ok: true, ...storeSnapshot(), catalogSize: unitCatalogById.size }, req);
       return;
     }
-    try {
-      const body = await readJsonBody(req, 8000);
-      const result = await applyStateStoreConfig({
-        store: body.store,
-        jsonWrite: body.jsonWrite,
-        sqliteWrite: body.sqliteWrite,
-        reload: body.reload !== false,
-      });
-      sendJson(res, 200, { ok: true, ...result }, req);
-    } catch (e) {
-      sendJson(res, e.status || 400, { ok: false, error: e.message }, req);
-    }
+    sendJson(res, 410, { ok: false, error: 'Catalog store is SQLite only; JSON/SQLite toggles were removed.' }, req);
     return;
   }
 
@@ -4980,9 +5225,9 @@ async function handleRequest(req, res) {
       sendJson(res, 200, getHistoryDatesLitePayload(), req);
       return;
     }
-    const dates = availableHistoryDates().map((d) => ({
+    const dates = knownBoardDates().map((d) => ({
       date: d,
-      hasState: existsSync(historyFileForDate(d)),
+      hasState: historyDayHasState(d),
       hasTimetable: !!pickTimetableForDate(d),
       snapshots: listHistorySnapshotsForDate(d).map((s) => s.savedAt).filter(Boolean).slice(-24),
     }));
@@ -5297,7 +5542,7 @@ function listenHttp() {
     server.once('error', reject);
     server.listen(cfg.port, cfg.host, () => {
       server.removeListener('error', reject);
-      daemonMode = 'fully_warm';
+      if (daemonMode === 'cold_starting') daemonMode = 'live_ready';
       resolveListen();
     });
   });
@@ -5423,16 +5668,15 @@ async function start() {
   logBoot('timetable');
   await reloadReferenceData();
 
-  if (STORE_ENV.sqliteWrite || STORE_ENV.store === 'sqlite') {
-    const opened = await createStateSqlite(SQLITE_PATH);
-    if (opened.ok) {
-      sqliteHandle = opened.handle;
-      logBoot('sqlite', SQLITE_PATH);
-    } else {
-      sqliteInitError = opened.error;
-      console.warn(`[daemon] sqlite unavailable (${opened.error}); JSON catalog only`);
-    }
+  const opened = await createStateSqlite(SQLITE_PATH);
+  if (opened.ok) {
+    sqliteHandle = opened.handle;
+    logBoot('sqlite', SQLITE_PATH);
+  } else {
+    sqliteInitError = opened.error;
+    console.warn(`[daemon] sqlite unavailable (${opened.error})`);
   }
+  persistStoreOverride();
 
   const persistedRaw = readPersistedStateRawIfFresh();
   if (persistedRaw?.lastAutoFetchRunYmd && /^\d{8}$/.test(String(persistedRaw.lastAutoFetchRunYmd))) {
@@ -5451,19 +5695,11 @@ async function start() {
   });
 
   liveCachesReady = true;
-  logBoot('prime', `past ${cfg.warmupDays} days + future ${cfg.warmupFutureDays} days`);
-  try {
-    await runHorizonWarmup();
-  } catch (e) {
-    console.warn(`[boot] horizon warmup failed: ${e.message}`);
-    daemonMode = 'fully_warm';
-  }
-  logBoot('prime', 'today + ±7 day boards and service details');
-  try {
-    await runLiveHotWarmup();
-  } catch (e) {
-    console.warn(`[boot] live hot warmup failed: ${e.message}`);
-  }
+  daemonMode = 'live_ready';
+  startMaintenanceTimers();
+  await listenHttp();
+  scheduleHotBoardTick();
+  logBoot('ready', `${((Date.now() - bootStarted) / 1000).toFixed(1)}s — accepting connections on :${cfg.port} (history warmup in background)`);
 
   logBoot('feeds', 'Darwin + PTAC');
   try {
@@ -5477,10 +5713,21 @@ async function start() {
     console.warn('[ptac] start failed:', e.message);
   }
 
-  startMaintenanceTimers();
-  await listenHttp();
-  scheduleHotBoardTick();
-  logBoot('ready', `${((Date.now() - bootStarted) / 1000).toFixed(1)}s — fully booted, accepting connections on :${cfg.port}`);
+  logBoot('prime', `past ${cfg.warmupDays} days + future ${cfg.warmupFutureDays} days`);
+  try {
+    await runHorizonWarmup();
+  } catch (e) {
+    console.warn(`[boot] horizon warmup failed: ${e.message}`);
+    daemonMode = 'fully_warm';
+  }
+  logBoot('prime', 'today + ±7 day boards and service details');
+  try {
+    await runLiveHotWarmup();
+  } catch (e) {
+    console.warn(`[boot] live hot warmup failed: ${e.message}`);
+  }
+  if (daemonMode !== 'fully_warm') daemonMode = 'fully_warm';
+  logBoot('ready', `${((Date.now() - bootStarted) / 1000).toFixed(1)}s — fully booted`);
   console.log(
     `[daemon] overnight: railway day 02:00 Europe/London. `
     + `PTAC unit/formation data often arrives 12–48h before that working day (kept in persist + unmatched queue; join index covers the next ${cfg.ptacAheadDays} days). `
