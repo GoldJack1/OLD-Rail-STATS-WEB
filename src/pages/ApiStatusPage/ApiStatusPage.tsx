@@ -1,25 +1,64 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { fetchDarwin } from '../../utils/darwinReadyFetch'
 import { PageTopHeader } from '../../components/misc'
-import { BUTWideButton } from '../../components/buttons'
+import { BUTWideButton, TOGToggleVisited } from '../../components/buttons'
 import './ApiStatusPage.css'
 
 type HealthPayload = {
   ok: boolean
+  mode?: string
+  liveCachesReady?: boolean
+  heavyReloadBusy?: boolean
+  heavyReloadReason?: string
+  clientReadsAllowed?: boolean
   loadedDate?: string
   startedAt?: string
+  processStartedAt?: string
   uptimeSec?: number
   uptimeMs?: number
+  journeysLoaded?: number
+  tiplocsIndexed?: number
+  timetableFile?: string
   memoryMB?: { heap?: number; rss?: number }
-  kafka?: { consumed?: number; updates?: number; startedAt?: string; lastKafkaMsgAt?: string }
-  ptac?: { enabled?: boolean; consumed?: number; matched?: number; unmatched?: number; errors?: number; lastMessageAt?: string }
-  overlaySize?: { live?: number; formations?: number; consists?: number; units?: number; unmatchedConsists?: number }
+  kafka?: {
+    consumed?: number
+    updates?: number
+    startedAt?: string
+    lastKafkaMsgAt?: string
+    sinceProcessStart?: boolean
+    processStartedAt?: string
+  }
+  ptac?: {
+    enabled?: boolean
+    consumed?: number
+    matched?: number
+    unmatched?: number
+    errors?: number
+    lastMessageAt?: string
+    unitsOnLoadedDate?: number
+    consistsOnLoadedDate?: number
+    topic?: string
+  }
+  overlaySize?: {
+    live?: number
+    cancelled?: number
+    delayed?: number
+    formations?: number
+    consists?: number
+    units?: number
+    unmatchedConsists?: number
+    stationsWithMessages?: number
+    messages?: number
+    ridsWithAssociations?: number
+    ridsWithAlerts?: number
+  }
   persistence?: {
     intervalSec?: number
     lastPersistAt?: string
     stateFile?: string
     fileSizeBytes?: number
     stateFileBytes?: number
+    dedupShards?: boolean
   }
   unitCatalog?: {
     size?: number
@@ -27,6 +66,30 @@ type HealthPayload = {
     file?: string
     fileSizeBytes?: number
     fileBytes?: number
+    jsonFileBytes?: number
+    store?: 'json' | 'sqlite'
+    jsonWrite?: boolean
+    sqliteWrite?: boolean
+    sqlite?: {
+      path?: string
+      bytes?: number | null
+      blobBytes?: number | null
+      units?: number
+      savedAt?: string | null
+      exists?: boolean
+      error?: string | null
+    }
+    lastLoad?: { source?: string | null; ms?: number | null; at?: string | null; fallback?: boolean }
+  }
+  warmup?: {
+    enabled?: boolean
+    days?: number
+    startedAt?: string | null
+    finishedAt?: string | null
+    current?: string | null
+    done?: number
+    skipped?: number
+    errors?: number
   }
   history?: { retentionDays?: number; dates?: string[] }
 }
@@ -90,12 +153,22 @@ function formatUptimeFromMs(v: unknown): string {
   return `${mins}m`
 }
 
+function Card({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <article className="api-status-card">
+      <h3>{title}</h3>
+      <p>{children}</p>
+    </article>
+  )
+}
+
 const ApiStatusPage: React.FC = () => {
   const [health, setHealth] = useState<HealthPayload | null>(null)
   const [status, setStatus] = useState<'loading' | 'ok' | 'error'>('loading')
   const [error, setError] = useState<string | null>(null)
   const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null)
   const [available, setAvailable] = useState<HistoryDatesPayload | null>(null)
+  const [storeBusy, setStoreBusy] = useState(false)
 
   const runFetch = async (isInitial = false) => {
     if (isInitial) setStatus('loading')
@@ -123,6 +196,25 @@ const ApiStatusPage: React.FC = () => {
     } catch {}
   }
 
+  const patchStore = async (body: Record<string, unknown>) => {
+    setStoreBusy(true)
+    setError(null)
+    try {
+      const res = await fetchDarwin('/api/darwin/admin/state-store', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const payload = await res.json().catch(() => null)
+      if (!res.ok) throw new Error(payload?.error || `HTTP ${res.status}`)
+      await runFetch(false)
+    } catch (e) {
+      setError((e as Error)?.message || 'Failed to update store.')
+    } finally {
+      setStoreBusy(false)
+    }
+  }
+
   useEffect(() => {
     runFetch(true)
     fetchAvailable()
@@ -134,46 +226,71 @@ const ApiStatusPage: React.FC = () => {
     }
   }, [])
 
+  const catalog = health?.unitCatalog
+  const sqliteOn = catalog?.store === 'sqlite'
+
   const summary = useMemo(() => {
     const stateBytes = pickNumber(health?.persistence?.fileSizeBytes, health?.persistence?.stateFileBytes)
-    const unitCatalogBytes = pickNumber(health?.unitCatalog?.fileSizeBytes, health?.unitCatalog?.fileBytes)
-    const totalCacheBytes = stateBytes !== null && unitCatalogBytes !== null
-      ? stateBytes + unitCatalogBytes
-      : null
+    const jsonBytes = pickNumber(health?.unitCatalog?.jsonFileBytes, health?.unitCatalog?.fileSizeBytes, health?.unitCatalog?.fileBytes)
+    const sqliteBytes = pickNumber(health?.unitCatalog?.sqlite?.bytes, health?.unitCatalog?.sqlite?.blobBytes)
     const uptimeFromNumericMs = pickNumber(
       health?.uptimeMs,
       typeof health?.uptimeSec === 'number' ? health.uptimeSec * 1000 : null
     )
-    const startedAtIso = health?.startedAt || health?.kafka?.startedAt
+    const startedAtIso = health?.processStartedAt || health?.startedAt || health?.kafka?.startedAt
     const derivedFromStartedAtMs = startedAtIso
       ? Math.max(0, Date.now() - new Date(startedAtIso).getTime())
       : null
     const uptimeMs = uptimeFromNumericMs ?? (Number.isFinite(derivedFromStartedAtMs) ? derivedFromStartedAtMs : null)
 
     return {
-    daemonStatus: health?.ok ? 'Healthy' : 'Unavailable',
-    loadedDate: health?.loadedDate || '-',
-    uptime: formatUptimeFromMs(uptimeMs),
-    kafkaConsumed: formatNum(health?.kafka?.consumed),
-    kafkaUpdates: formatNum(health?.kafka?.updates),
-    formations: formatNum(health?.overlaySize?.formations),
-    consists: formatNum(health?.overlaySize?.consists),
-    units: formatNum(health?.overlaySize?.units),
-    unitCatalog: formatNum(health?.unitCatalog?.size),
-    heap: formatNum(health?.memoryMB?.heap),
-    rss: formatNum(health?.memoryMB?.rss),
-    persistEvery: `${formatNum(health?.persistence?.intervalSec)}s`,
-    lastPersist: health?.persistence?.lastPersistAt || '-',
-    ptac: health?.ptac?.enabled ? 'Enabled' : 'Disabled',
-    ptacErrors: formatNum(health?.ptac?.errors),
-    ptacMatched: formatNum(health?.ptac?.matched),
-    ptacUnmatched: formatNum(health?.ptac?.unmatched),
-    kafkaLastMessageAt: health?.kafka?.lastKafkaMsgAt || '-',
-    stateCacheFileName: health?.persistence?.stateFile || '-',
-    unitCatalogFileName: health?.unitCatalog?.file || '-',
-    stateCacheFileSize: formatBytes(stateBytes),
-    unitCatalogFileSize: formatBytes(unitCatalogBytes),
-    totalCacheSize: formatBytes(totalCacheBytes),
+      daemonStatus: health?.ok ? (health.heavyReloadBusy ? 'Reloading' : health.mode || 'Healthy') : 'Unavailable',
+      loadedDate: health?.loadedDate || '-',
+      uptime: formatUptimeFromMs(uptimeMs),
+      processStartedAt: startedAtIso || '-',
+      kafkaConsumed: formatNum(health?.kafka?.consumed),
+      kafkaUpdates: formatNum(health?.kafka?.updates),
+      journeys: formatNum(health?.journeysLoaded),
+      tiplocs: formatNum(health?.tiplocsIndexed),
+      timetableFile: health?.timetableFile || '-',
+      live: formatNum(health?.overlaySize?.live),
+      cancelled: formatNum(health?.overlaySize?.cancelled),
+      formations: formatNum(health?.overlaySize?.formations),
+      consists: formatNum(health?.overlaySize?.consists),
+      units: formatNum(health?.overlaySize?.units),
+      unitCatalog: formatNum(health?.unitCatalog?.size),
+      messages: formatNum(health?.overlaySize?.messages),
+      stationsWithMessages: formatNum(health?.overlaySize?.stationsWithMessages),
+      associations: formatNum(health?.overlaySize?.ridsWithAssociations),
+      alerts: formatNum(health?.overlaySize?.ridsWithAlerts),
+      unmatchedConsists: formatNum(health?.overlaySize?.unmatchedConsists),
+      heap: formatNum(health?.memoryMB?.heap),
+      rss: formatNum(health?.memoryMB?.rss),
+      persistEvery: `${formatNum(health?.persistence?.intervalSec)}s`,
+      lastPersist: health?.persistence?.lastPersistAt || '-',
+      ptac: health?.ptac?.enabled ? 'Enabled' : 'Disabled',
+      ptacConsumed: formatNum(health?.ptac?.consumed),
+      ptacErrors: formatNum(health?.ptac?.errors),
+      ptacMatched: formatNum(health?.ptac?.matched),
+      ptacUnmatched: formatNum(health?.ptac?.unmatched),
+      ptacUnitsToday: formatNum(health?.ptac?.unitsOnLoadedDate),
+      ptacConsistsToday: formatNum(health?.ptac?.consistsOnLoadedDate),
+      kafkaLastMessageAt: health?.kafka?.lastKafkaMsgAt || '-',
+      stateCacheFileName: health?.persistence?.stateFile || '-',
+      unitCatalogFileName: health?.unitCatalog?.file || '-',
+      stateCacheFileSize: formatBytes(stateBytes),
+      unitCatalogFileSize: formatBytes(jsonBytes),
+      sqliteFileSize: formatBytes(sqliteBytes),
+      sqliteBlobSize: formatBytes(health?.unitCatalog?.sqlite?.blobBytes),
+      lastLoadSource: health?.unitCatalog?.lastLoad?.source || '-',
+      lastLoadMs: health?.unitCatalog?.lastLoad?.ms != null ? `${health.unitCatalog.lastLoad.ms} ms` : '-',
+      lastLoadAt: health?.unitCatalog?.lastLoad?.at || '-',
+      lastLoadFallback: health?.unitCatalog?.lastLoad?.fallback ? 'Yes' : 'No',
+      liveCachesReady: health?.liveCachesReady ? 'Yes' : 'No',
+      clientReads: health?.clientReadsAllowed ? 'Yes' : 'No',
+      warmup: health?.warmup
+        ? `${formatNum(health.warmup.done)} done / ${formatNum(health.warmup.skipped)} skipped / ${formatNum(health.warmup.errors)} errors`
+        : '-',
     }
   }, [health])
 
@@ -189,7 +306,7 @@ const ApiStatusPage: React.FC = () => {
     <div className="api-status-shell">
       <PageTopHeader
         title="API Status"
-        subtitle={status === 'ok' ? 'Live Darwin daemon health and cache telemetry' : 'Connecting to API health...'}
+        subtitle={status === 'ok' ? 'Live Darwin daemon health, Kafka counters, and catalog store' : 'Connecting to API health...'}
       />
       <div className="api-status-page">
         <section className="api-status-controls">
@@ -197,53 +314,157 @@ const ApiStatusPage: React.FC = () => {
             Refresh now
           </BUTWideButton>
           {status === 'error' && <p className="api-status-error">{error}</p>}
+          {status === 'ok' && error && <p className="api-status-error">{error}</p>}
           {status === 'ok' && <p className="api-status-meta">Last update: {lastUpdatedAt ? displayDateTime(lastUpdatedAt) : '-'}</p>}
         </section>
 
-        <section className="api-status-grid" aria-label="API health summary">
-          <article className="api-status-card"><h3>Daemon status</h3><p>{summary.daemonStatus}</p></article>
-          <article className="api-status-card"><h3>Loaded date</h3><p>{summary.loadedDate}</p></article>
-          <article className="api-status-card"><h3>Uptime</h3><p>{summary.uptime}</p></article>
-          <article className="api-status-card"><h3>Kafka consumed</h3><p>{summary.kafkaConsumed}</p></article>
-          <article className="api-status-card"><h3>Kafka updates</h3><p>{summary.kafkaUpdates}</p></article>
-          <article className="api-status-card"><h3>Formations</h3><p>{summary.formations}</p></article>
-          <article className="api-status-card"><h3>Consists</h3><p>{summary.consists}</p></article>
-          <article className="api-status-card"><h3>Units</h3><p>{summary.units}</p></article>
-          <article className="api-status-card"><h3>Unit catalog</h3><p>{summary.unitCatalog}</p></article>
-          <article className="api-status-card"><h3>PTAC</h3><p>{summary.ptac}</p></article>
-          <article className="api-status-card"><h3>Heap MB</h3><p>{summary.heap}</p></article>
-          <article className="api-status-card"><h3>RSS MB</h3><p>{summary.rss}</p></article>
-          <article className="api-status-card"><h3>Persist</h3><p>{summary.persistEvery} · {summary.lastPersist}</p></article>
-          <article className="api-status-card"><h3>PTAC errors</h3><p>{summary.ptacErrors}</p></article>
-          <article className="api-status-card"><h3>PTAC matched</h3><p>{summary.ptacMatched}</p></article>
-          <article className="api-status-card"><h3>PTAC unmatched</h3><p>{summary.ptacUnmatched}</p></article>
-          <article className="api-status-card"><h3>Kafka last message</h3><p>{summary.kafkaLastMessageAt === '-' ? '-' : displayDateTime(summary.kafkaLastMessageAt)}</p></article>
+        <section className="api-panel" aria-label="Catalog store">
+          <h2>Catalog store</h2>
+          <p className="api-panel-subtitle">
+            Darwin keeps both copies on disk. SQLite is the compressed catalog; JSON is the rollback file.
+            Kafka live state still uses gzip shards — this toggle only changes how the unit catalog is loaded.
+          </p>
+          <div className="api-store-toggles">
+            <label className="api-store-row">
+              <span>
+                Load catalog from SQLite
+                <small>Off = load JSON. On = load SQLite, fall back to JSON if it fails.</small>
+              </span>
+              <TOGToggleVisited
+                checked={sqliteOn}
+                disabled={storeBusy || status !== 'ok'}
+                ariaLabel="Load catalog from SQLite"
+                onChange={(next) => void patchStore({
+                  store: next ? 'sqlite' : 'json',
+                  jsonWrite: catalog?.jsonWrite !== false,
+                  sqliteWrite: catalog?.sqliteWrite !== false,
+                  reload: true,
+                })}
+              />
+            </label>
+            <label className="api-store-row">
+              <span>
+                Write JSON
+                <small>Keep unit-catalog.json updated so you can switch back.</small>
+              </span>
+              <TOGToggleVisited
+                checked={catalog?.jsonWrite !== false}
+                disabled={storeBusy || status !== 'ok'}
+                ariaLabel="Write JSON catalog"
+                onChange={(next) => void patchStore({
+                  store: catalog?.store || 'sqlite',
+                  jsonWrite: next,
+                  sqliteWrite: catalog?.sqliteWrite !== false,
+                  reload: false,
+                })}
+              />
+            </label>
+            <label className="api-store-row">
+              <span>
+                Write SQLite
+                <small>Keep darwin-state.sqlite updated.</small>
+              </span>
+              <TOGToggleVisited
+                checked={catalog?.sqliteWrite !== false}
+                disabled={storeBusy || status !== 'ok'}
+                ariaLabel="Write SQLite catalog"
+                onChange={(next) => void patchStore({
+                  store: catalog?.store || 'json',
+                  jsonWrite: catalog?.jsonWrite !== false,
+                  sqliteWrite: next,
+                  reload: false,
+                })}
+              />
+            </label>
+          </div>
+          <div className="api-status-grid">
+            <Card title="Active read">{sqliteOn ? 'SQLite' : 'JSON'}</Card>
+            <Card title="Last load source">{summary.lastLoadSource}</Card>
+            <Card title="Last load time">{summary.lastLoadMs}</Card>
+            <Card title="Fell back">{summary.lastLoadFallback}</Card>
+            <Card title="JSON file">{summary.unitCatalogFileSize}</Card>
+            <Card title="SQLite file">{summary.sqliteFileSize}</Card>
+            <Card title="SQLite blob">{summary.sqliteBlobSize}</Card>
+            <Card title="Catalog units">{summary.unitCatalog}</Card>
+          </div>
+        </section>
+
+        <section className="api-status-grid" aria-label="Daemon">
+          <Card title="Daemon status">{summary.daemonStatus}</Card>
+          <Card title="Live caches ready">{summary.liveCachesReady}</Card>
+          <Card title="Client reads">{summary.clientReads}</Card>
+          <Card title="Loaded date">{summary.loadedDate}</Card>
+          <Card title="Uptime">{summary.uptime}</Card>
+          <Card title="Process started">{summary.processStartedAt === '-' ? '-' : displayDateTime(summary.processStartedAt)}</Card>
+          <Card title="Journeys">{summary.journeys}</Card>
+          <Card title="TIPLOCs">{summary.tiplocs}</Card>
+          <Card title="Timetable">{summary.timetableFile}</Card>
+          <Card title="Warmup">{summary.warmup}</Card>
+        </section>
+
+        <section className="api-panel" aria-label="Kafka">
+          <h2>Kafka</h2>
+          <p className="api-panel-subtitle">
+            Consumed and updates count from this process only. They reset to zero on every Darwin restart.
+            Overlay caches are restored from disk separately.
+          </p>
+          <div className="api-status-grid">
+            <Card title="Consumed">{summary.kafkaConsumed}</Card>
+            <Card title="Updates">{summary.kafkaUpdates}</Card>
+            <Card title="Last message">{summary.kafkaLastMessageAt === '-' ? '-' : displayDateTime(summary.kafkaLastMessageAt)}</Card>
+            <Card title="PTAC">{summary.ptac}</Card>
+            <Card title="PTAC consumed">{summary.ptacConsumed}</Card>
+            <Card title="PTAC matched">{summary.ptacMatched}</Card>
+            <Card title="PTAC unmatched">{summary.ptacUnmatched}</Card>
+            <Card title="PTAC errors">{summary.ptacErrors}</Card>
+            <Card title="PTAC units today">{summary.ptacUnitsToday}</Card>
+            <Card title="PTAC consists today">{summary.ptacConsistsToday}</Card>
+          </div>
+        </section>
+
+        <section className="api-panel" aria-label="In-memory caches">
+          <h2>In-memory caches</h2>
+          <div className="api-status-grid">
+            <Card title="Live overlays">{summary.live}</Card>
+            <Card title="Cancelled">{summary.cancelled}</Card>
+            <Card title="Formations">{summary.formations}</Card>
+            <Card title="Consists">{summary.consists}</Card>
+            <Card title="Units (today)">{summary.units}</Card>
+            <Card title="Unmatched consists">{summary.unmatchedConsists}</Card>
+            <Card title="Messages">{summary.messages}</Card>
+            <Card title="Stations with messages">{summary.stationsWithMessages}</Card>
+            <Card title="Associations">{summary.associations}</Card>
+            <Card title="Alerts">{summary.alerts}</Card>
+            <Card title="Heap MB">{summary.heap}</Card>
+            <Card title="RSS MB">{summary.rss}</Card>
+            <Card title="Persist">{summary.persistEvery} · {summary.lastPersist === '-' ? '-' : displayDateTime(summary.lastPersist)}</Card>
+          </div>
         </section>
 
         <section className="api-panel" aria-label="Cache file details">
-          <h2>Cache Files</h2>
-          <p className="api-panel-subtitle">Cache filenames and total on-disk footprint.</p>
+          <h2>Cache files</h2>
+          <p className="api-panel-subtitle">On-disk footprint for the live state cache and both catalog copies.</p>
           <div className="api-status-grid">
-            <article className="api-status-card"><h3>State cache filename</h3><p>{summary.stateCacheFileName}</p></article>
-            <article className="api-status-card"><h3>Unit catalog filename</h3><p>{summary.unitCatalogFileName}</p></article>
-            <article className="api-status-card"><h3>State cache file</h3><p>{summary.stateCacheFileSize}</p></article>
-            <article className="api-status-card"><h3>Unit catalog file</h3><p>{summary.unitCatalogFileSize}</p></article>
-            <article className="api-status-card"><h3>Total cache size</h3><p>{summary.totalCacheSize}</p></article>
+            <Card title="State cache filename">{summary.stateCacheFileName}</Card>
+            <Card title="Unit catalog JSON">{summary.unitCatalogFileName}</Card>
+            <Card title="State cache file">{summary.stateCacheFileSize}</Card>
+            <Card title="Unit catalog JSON size">{summary.unitCatalogFileSize}</Card>
+            <Card title="SQLite catalog">{summary.sqliteFileSize}</Card>
           </div>
         </section>
 
         <section className="api-panel" aria-label="Available historical data">
-          <h2>Available Data</h2>
+          <h2>Available data</h2>
           <p className="api-panel-subtitle">
             {available
               ? `${available.count} date(s) · retention ${available.retentionDays} days`
               : 'Loading available history dates...'}
           </p>
           <div className="api-status-grid">
-            <article className="api-status-card"><h3>Total snapshots</h3><p>{formatNum(historyTotals.snapshots)}</p></article>
-            <article className="api-status-card"><h3>Dates with state</h3><p>{formatNum(historyTotals.withState)}</p></article>
-            <article className="api-status-card"><h3>Dates with timetable</h3><p>{formatNum(historyTotals.withTimetable)}</p></article>
-            <article className="api-status-card"><h3>History dates listed</h3><p>{formatNum(available?.count)}</p></article>
+            <Card title="Total snapshots">{formatNum(historyTotals.snapshots)}</Card>
+            <Card title="Dates with state">{formatNum(historyTotals.withState)}</Card>
+            <Card title="Dates with timetable">{formatNum(historyTotals.withTimetable)}</Card>
+            <Card title="History dates listed">{formatNum(available?.count)}</Card>
           </div>
           <div className="api-available-list">
             {(available?.dates || []).slice(0, 10).map((d) => (

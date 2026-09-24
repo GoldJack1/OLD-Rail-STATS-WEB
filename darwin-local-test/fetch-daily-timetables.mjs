@@ -10,8 +10,10 @@
  *
  * Env:
  *   DARWIN_YMD           optional compact override YYYYMMDD (default = UK railway day now)
- *   DARWIN_TIMETABLE_DIR optional absolute or relative target directory
+ *   DARWIN_TIMETABLE_DIR optional absolute or relative target directory for today
  *   DARWIN_GCS_PPT_PREFIX gs://… prefix (default in code)
+ *   DARWIN_LOOKBACK_DAYS extra past railway days to download (default 1)
+ *   DARWIN_LOOKAHEAD_DAYS extra future railway days to download when GCS has objects (default 30)
  *   GSUTIL_PATH          optional full path to gsutil (cron often has a minimal PATH)
  */
 import { execFileSync } from 'node:child_process';
@@ -170,46 +172,53 @@ function ensureDaemonAliasSymlinks(targetDir, railwayYmdCompact) {
 
 function main() {
   const ymd = process.env.DARWIN_YMD || railwayDayYmdCompact();
-  const targetDir = resolve(__dirname, process.env.DARWIN_TIMETABLE_DIR || `./tt/${ymd}`);
-  ensureDir(targetDir);
-  const candidateDates = [ymd, shiftYmd(ymd, -1)];
-  let selectedDate = null;
-  let v8Uri = null;
-  let refV99Uri = null;
+  const lookback = Math.max(0, Number(process.env.DARWIN_LOOKBACK_DAYS || 1));
+  const lookahead = Math.max(0, Number(process.env.DARWIN_LOOKAHEAD_DAYS || 30));
+  const todayDir = resolve(__dirname, process.env.DARWIN_TIMETABLE_DIR || `./tt/${ymd}`);
+  const wanted = [];
+  for (let i = -lookback; i <= lookahead; i++) wanted.push(shiftYmd(ymd, i));
+  const wantedSet = new Set(wanted);
 
-  for (const d of candidateDates) {
-    console.log(`[fetch] scanning ${BUCKET_PREFIX} for date ${d}`);
-    const files = listFilesByPattern(`${BUCKET_PREFIX}/${d}*`);
-    v8Uri = pickLatest(files, /^(\d{14})_v8\.xml\.gz$/);
-    refV99Uri = pickLatest(files, /^(\d{14})_ref_v99\.xml\.gz$/);
-    if (v8Uri && refV99Uri) {
-      selectedDate = d;
-      break;
+  console.log(`[fetch] listing ${BUCKET_PREFIX}/* for ${wanted[0]}…${wanted[wanted.length - 1]}`);
+  const allFiles = listFilesByPattern(`${BUCKET_PREFIX}/*`);
+  const byDate = new Map();
+  for (const uri of allFiles) {
+    const name = basename(uri);
+    const m = /^(\d{8})/.exec(name);
+    if (!m || !wantedSet.has(m[1])) continue;
+    if (!byDate.has(m[1])) byDate.set(m[1], []);
+    byDate.get(m[1]).push(uri);
+  }
+
+  let downloaded = 0;
+  let skipped = 0;
+  for (const d of wanted) {
+    const files = byDate.get(d) || [];
+    let v8Uri = pickLatest(files, /^(\d{14})_v8\.xml\.gz$/);
+    let refV99Uri = pickLatest(files, /^(\d{14})_ref_v99\.xml\.gz$/);
+    if (d === ymd && (!v8Uri || !refV99Uri)) {
+      console.log(`[fetch] date-scoped scan missed files for ${d}, falling back to latest available under ${BUCKET_PREFIX}`);
+      if (!v8Uri) v8Uri = pickLatest(allFiles, /^(\d{14})_v8\.xml\.gz$/);
+      if (!refV99Uri) refV99Uri = pickLatest(allFiles, /^(\d{14})_ref_v99\.xml\.gz$/);
     }
+    if (!v8Uri) {
+      if (d !== ymd) console.log(`[fetch] no v8 object for ${d}`);
+      continue;
+    }
+    const targetDir = d === ymd ? todayDir : resolve(__dirname, `./tt/${d}`);
+    ensureDir(targetDir);
+    console.log(`[fetch] ${d} v8=${basename(v8Uri)}${refV99Uri ? ` ref=${basename(refV99Uri)}` : ''}`);
+    const results = [maybeDownload(v8Uri, targetDir)];
+    if (refV99Uri) results.push(maybeDownload(refV99Uri, targetDir));
+    downloaded += results.filter((r) => r.status === 'downloaded').length;
+    skipped += results.filter((r) => r.status === 'skipped').length;
+    ensureDaemonAliasSymlinks(targetDir, d);
   }
 
-  // Last fallback: pick latest available from the whole prefix.
-  if (!v8Uri || !refV99Uri) {
-    console.log(`[fetch] date-scoped scan missed files, falling back to latest available under ${BUCKET_PREFIX}`);
-    const allFiles = listFilesByPattern(`${BUCKET_PREFIX}/*`);
-    if (!v8Uri) v8Uri = pickLatest(allFiles, /^(\d{14})_v8\.xml\.gz$/);
-    if (!refV99Uri) refV99Uri = pickLatest(allFiles, /^(\d{14})_ref_v99\.xml\.gz$/);
-    selectedDate = selectedDate || 'latest-available';
-  }
-
-  if (!v8Uri) throw new Error(`no v8 file found (checked ${candidateDates.join(', ')} and full prefix)`);
-  if (!refV99Uri) throw new Error(`no ref_v99 file found (checked ${candidateDates.join(', ')} and full prefix)`);
-
-  console.log(`[fetch] selected v8: ${basename(v8Uri)}`);
-  console.log(`[fetch] selected ref_v99: ${basename(refV99Uri)}`);
-  console.log(`[fetch] source date window: ${selectedDate}`);
+  const todayV8 = pickLatest(byDate.get(ymd) || [], /^(\d{14})_v8\.xml\.gz$/) || pickLatest(allFiles, /^(\d{14})_v8\.xml\.gz$/);
+  if (!todayV8) throw new Error(`no v8 file found (checked ${wanted.join(', ')} and full prefix)`);
   console.log(`[fetch] using gsutil: ${GSUTIL}`);
-
-  const results = [maybeDownload(v8Uri, targetDir), maybeDownload(refV99Uri, targetDir)];
-  const downloaded = results.filter((r) => r.status === 'downloaded').length;
-  const skipped = results.filter((r) => r.status === 'skipped').length;
-  ensureDaemonAliasSymlinks(targetDir, ymd);
-  console.log(`[fetch] complete: downloaded=${downloaded}, skipped=${skipped}, dir=${targetDir}`);
+  console.log(`[fetch] complete: downloaded=${downloaded}, skipped=${skipped}, today=${todayDir}`);
 }
 
 try {

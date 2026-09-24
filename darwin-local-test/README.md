@@ -308,7 +308,7 @@ consumes and exposes the following Push Port elements:
 | Element              | Where it surfaces |
 |----------------------|-------------------|
 | `serviceLoading`     | `loadingPercentage` (0–100) on each board row and service-detail stop |
-| `formationLoading`   | `coachLoading[]` (1–10 enum per coach) on each row and stop |
+| `formationLoading`   | `coachLoading[]` (0–100% per coach) on each row and stop |
 | `scheduleFormations` | `formation` ({ fid, coaches[] }) on service detail |
 | `association`        | `associations[]` on service detail (joins / divides / next-portion) |
 | `OW` (NRCC)          | `messages[]` on each board response, also via `/api/messages/:crs` |

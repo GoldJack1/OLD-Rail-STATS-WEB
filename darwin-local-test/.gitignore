@@ -2,4 +2,7 @@ node_modules/
 .env
 *.log
 state/
+ttis/*.txt
+ttis/*.MCA
+ttis/*.mca
 
